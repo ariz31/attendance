@@ -1,6 +1,9 @@
 **/**
 !appsscript.json
 !Code.gs
+!Seating.gs
 !Index.html
 !Styles.html
+!SeatingStyles.html
 !Client.html
+!SeatingClient.html

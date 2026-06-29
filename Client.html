@@ -1,0 +1,690 @@
+<script>
+  (function() {
+    'use strict';
+
+    const DB_NAME = 'attendance-capture-db';
+    const DB_VERSION = 1;
+    const RECORD_STORE = 'records';
+    const SETTINGS_STORE = 'settings';
+    const MAX_CLIENT_IMAGE_BYTES = 5 * 1024 * 1024;
+
+    const state = {
+      db: null,
+      selectedPreviewUrl: null,
+      syncing: false,
+      config: null,
+      toastTimer: null
+    };
+
+    const $ = (id) => document.getElementById(id);
+
+    document.addEventListener('DOMContentLoaded', init);
+
+    async function init() {
+      try {
+        state.db = await openDatabase();
+        bindEvents();
+        updateConnectionStatus();
+        await ensureDeviceId();
+        await refreshQueueStats();
+        await loadAppConfig();
+
+        window.addEventListener('online', async () => {
+          updateConnectionStatus();
+          showToast('Internet connection restored. Syncing pending records...');
+          await syncQueue();
+        });
+
+        window.addEventListener('offline', () => {
+          updateConnectionStatus();
+          showToast('You are offline. New records will stay on this device.');
+        });
+      } catch (error) {
+        showToast('App failed to initialize: ' + error.message, true);
+      }
+    }
+
+    function bindEvents() {
+      $('attendanceForm').addEventListener('submit', handleFormSubmit);
+      $('imageInput').addEventListener('change', handleImageSelection);
+      $('setupBtn').addEventListener('click', handleSetupClick);
+      $('syncBtn').addEventListener('click', syncQueue);
+      $('clearSyncedBtn').addEventListener('click', clearSyncedRecords);
+      $('recentBtn').addEventListener('click', loadRecentRecords);
+    }
+
+    function openDatabase() {
+      return new Promise((resolve, reject) => {
+        if (!('indexedDB' in window)) {
+          reject(new Error('IndexedDB is not supported in this browser.'));
+          return;
+        }
+
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+        request.onupgradeneeded = function() {
+          const db = request.result;
+
+          if (!db.objectStoreNames.contains(RECORD_STORE)) {
+            const store = db.createObjectStore(RECORD_STORE, { keyPath: 'id' });
+            store.createIndex('status', 'status', { unique: false });
+            store.createIndex('createdAt', 'createdAt', { unique: false });
+          }
+
+          if (!db.objectStoreNames.contains(SETTINGS_STORE)) {
+            db.createObjectStore(SETTINGS_STORE, { keyPath: 'key' });
+          }
+        };
+
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error('Unable to open local database.'));
+      });
+    }
+
+    function transaction(storeName, mode, callback) {
+      return new Promise((resolve, reject) => {
+        const tx = state.db.transaction(storeName, mode);
+        const store = tx.objectStore(storeName);
+        let requestResult;
+
+        tx.oncomplete = () => resolve(requestResult);
+        tx.onerror = () => reject(tx.error || new Error('Local database transaction failed.'));
+        tx.onabort = () => reject(tx.error || new Error('Local database transaction aborted.'));
+
+        requestResult = callback(store);
+      });
+    }
+
+    function requestToPromise(request) {
+      return new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error('Local database request failed.'));
+      });
+    }
+
+    async function putRecord(record) {
+      await transaction(RECORD_STORE, 'readwrite', (store) => store.put(record));
+    }
+
+    async function deleteRecord(id) {
+      await transaction(RECORD_STORE, 'readwrite', (store) => store.delete(id));
+    }
+
+    async function getAllRecords() {
+      return transaction(RECORD_STORE, 'readonly', (store) => requestToPromise(store.getAll()));
+    }
+
+    async function putSetting(key, value) {
+      await transaction(SETTINGS_STORE, 'readwrite', (store) => store.put({ key, value }));
+    }
+
+    async function getSetting(key) {
+      const result = await transaction(SETTINGS_STORE, 'readonly', (store) => requestToPromise(store.get(key)));
+      return result ? result.value : null;
+    }
+
+    async function ensureDeviceId() {
+      let deviceId = await getSetting('deviceId');
+      if (!deviceId) {
+        deviceId = 'device-' + createUuid();
+        await putSetting('deviceId', deviceId);
+      }
+      return deviceId;
+    }
+
+    async function handleFormSubmit(event) {
+      event.preventDefault();
+
+      const saveBtn = $('saveBtn');
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Compressing image...';
+
+      try {
+        const name = $('nameInput').value.trim();
+        const classCode = $('classCodeInput').value.trim();
+        const title = $('titleInput').value.trim();
+        const imageFile = $('imageInput').files[0];
+
+        if (!name || !classCode || !title) {
+          throw new Error('Name, class code, and title are required.');
+        }
+
+        if (!imageFile) {
+          throw new Error('Please select or capture an image.');
+        }
+
+        if (!imageFile.type || !imageFile.type.startsWith('image/')) {
+          throw new Error('The selected file must be an image.');
+        }
+
+        const maxDimension = Number($('maxDimensionInput').value) || 1280;
+        const quality = Number($('qualityInput').value) || 0.7;
+        const compressed = await compressImage(imageFile, maxDimension, quality);
+
+        if (compressed.blob.size > MAX_CLIENT_IMAGE_BYTES) {
+          throw new Error('Compressed image is still too large. Choose a smaller dimension or lower quality.');
+        }
+
+        const imageBase64 = await blobToDataUrl(compressed.blob);
+        const deviceId = await ensureDeviceId();
+
+        const record = {
+          id: createUuid(),
+          name,
+          classCode,
+          title,
+          imageBase64,
+          mimeType: compressed.blob.type || 'image/jpeg',
+          sourceFileName: imageFile.name || 'attendance-image.jpg',
+          originalSize: imageFile.size || 0,
+          compressedSize: compressed.blob.size || 0,
+          compressedWidth: compressed.width,
+          compressedHeight: compressed.height,
+          compressionQuality: quality,
+          deviceId,
+          clientTimestamp: new Date().toISOString(),
+          createdAt: Date.now(),
+          attempts: 0,
+          status: 'pending',
+          lastError: ''
+        };
+
+        await putRecord(record);
+        await refreshQueueStats();
+        updateImageMeta(imageFile, compressed);
+        showToast('Saved locally. It will sync when online.');
+        $('attendanceForm').reset();
+        clearPreview();
+
+        if (navigator.onLine) {
+          await syncQueue();
+        }
+      } catch (error) {
+        showToast(error.message, true);
+      } finally {
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Save to Offline Queue';
+      }
+    }
+
+    async function handleImageSelection(event) {
+      const file = event.target.files[0];
+      if (!file) {
+        clearPreview();
+        return;
+      }
+
+      if (state.selectedPreviewUrl) {
+        URL.revokeObjectURL(state.selectedPreviewUrl);
+      }
+
+      state.selectedPreviewUrl = URL.createObjectURL(file);
+      $('imagePreview').src = state.selectedPreviewUrl;
+      $('previewPanel').hidden = false;
+      $('imageMeta').textContent = file.name + ' • original size ' + formatBytes(file.size || 0);
+    }
+
+    function clearPreview() {
+      if (state.selectedPreviewUrl) {
+        URL.revokeObjectURL(state.selectedPreviewUrl);
+        state.selectedPreviewUrl = null;
+      }
+
+      $('imagePreview').removeAttribute('src');
+      $('previewPanel').hidden = true;
+      $('imageMeta').textContent = 'Waiting for image...';
+    }
+
+    function updateImageMeta(originalFile, compressed) {
+      const savings = originalFile.size > 0
+        ? Math.max(0, 100 - Math.round((compressed.blob.size / originalFile.size) * 100))
+        : 0;
+
+      $('imageMeta').textContent = [
+        originalFile.name,
+        'original ' + formatBytes(originalFile.size || 0),
+        'compressed ' + formatBytes(compressed.blob.size || 0),
+        compressed.width + '×' + compressed.height,
+        savings + '% smaller'
+      ].join(' • ');
+    }
+
+    async function compressImage(file, maxDimension, quality) {
+      const image = await loadImage(file);
+      const sourceWidth = image.naturalWidth || image.width;
+      const sourceHeight = image.naturalHeight || image.height;
+      const scale = Math.min(1, maxDimension / Math.max(sourceWidth, sourceHeight));
+      const width = Math.max(1, Math.round(sourceWidth * scale));
+      const height = Math.max(1, Math.round(sourceHeight * scale));
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+
+      const ctx = canvas.getContext('2d', { alpha: false });
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(image, 0, 0, width, height);
+
+      const blob = await new Promise((resolve, reject) => {
+        canvas.toBlob((result) => {
+          if (result) resolve(result);
+          else reject(new Error('Image compression failed.'));
+        }, 'image/jpeg', quality);
+      });
+
+      return { blob, width, height };
+    }
+
+    function loadImage(file) {
+      return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(file);
+        const image = new Image();
+
+        image.onload = () => {
+          URL.revokeObjectURL(url);
+          resolve(image);
+        };
+
+        image.onerror = () => {
+          URL.revokeObjectURL(url);
+          reject(new Error('Could not read selected image.'));
+        };
+
+        image.src = url;
+      });
+    }
+
+    function blobToDataUrl(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error || new Error('Could not encode compressed image.'));
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    async function syncQueue() {
+      if (state.syncing) {
+        return;
+      }
+
+      if (!navigator.onLine) {
+        showToast('You are offline. Sync will resume when the connection returns.');
+        updateConnectionStatus();
+        return;
+      }
+
+      state.syncing = true;
+      $('syncBtn').disabled = true;
+      $('syncBtn').textContent = 'Syncing...';
+
+      try {
+        const records = await getAllRecords();
+        const pending = records
+          .filter((record) => record.status === 'pending' || record.status === 'error')
+          .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+
+        if (pending.length === 0) {
+          showToast('No pending records to sync.');
+          return;
+        }
+
+        let syncedCount = 0;
+
+        for (const record of pending) {
+          const syncingRecord = Object.assign({}, record, {
+            status: 'syncing',
+            attempts: (record.attempts || 0) + 1,
+            lastError: ''
+          });
+
+          await putRecord(syncingRecord);
+          await refreshQueueStats();
+
+          try {
+            const payload = stripLocalOnlyFields(syncingRecord);
+            const response = await runServer('saveAttendanceRecords', [[payload]]);
+            const result = response && response.results && response.results[0];
+
+            if (!result) {
+              throw new Error('Server did not return a sync result.');
+            }
+
+            if (result.status === 'synced' || result.status === 'duplicate') {
+              const syncedRecord = Object.assign({}, syncingRecord, {
+                status: result.status,
+                serverFileId: result.fileId || '',
+                serverImageUrl: result.imageUrl || '',
+                syncedAt: new Date().toISOString(),
+                lastError: ''
+              });
+              await putRecord(syncedRecord);
+              syncedCount += 1;
+            } else {
+              throw new Error(result.message || 'Server rejected the record.');
+            }
+          } catch (error) {
+            const failedRecord = Object.assign({}, syncingRecord, {
+              status: 'error',
+              lastError: error.message || String(error)
+            });
+            await putRecord(failedRecord);
+            showToast('Sync paused: ' + failedRecord.lastError, true);
+            break;
+          }
+        }
+
+        $('lastSyncLabel').textContent = 'Last sync: ' + new Date().toLocaleTimeString();
+        await refreshQueueStats();
+
+        if (syncedCount > 0) {
+          showToast('Synced ' + syncedCount + ' record' + (syncedCount === 1 ? '' : 's') + '.');
+          await loadAppConfig(false);
+        }
+      } finally {
+        state.syncing = false;
+        $('syncBtn').disabled = false;
+        $('syncBtn').textContent = 'Sync Now';
+      }
+    }
+
+    function stripLocalOnlyFields(record) {
+      return {
+        id: record.id,
+        name: record.name,
+        classCode: record.classCode,
+        title: record.title,
+        imageBase64: record.imageBase64,
+        mimeType: record.mimeType,
+        sourceFileName: record.sourceFileName,
+        originalSize: record.originalSize,
+        compressedSize: record.compressedSize,
+        deviceId: record.deviceId,
+        clientTimestamp: record.clientTimestamp
+      };
+    }
+
+    async function handleSetupClick() {
+      if (!navigator.onLine) {
+        showToast('You need internet connection for first-time database setup.', true);
+        return;
+      }
+
+      $('setupBtn').disabled = true;
+      $('setupBtn').textContent = 'Initializing...';
+
+      try {
+        const config = await runServer('setup');
+        state.config = config;
+        renderConfig(config);
+        showToast('Database initialized. You can now sync records.');
+        await syncQueue();
+      } catch (error) {
+        showToast('Setup failed: ' + error.message, true);
+      } finally {
+        $('setupBtn').disabled = false;
+        $('setupBtn').textContent = 'Initialize Database';
+      }
+    }
+
+    async function loadAppConfig(showErrors) {
+      try {
+        const config = await runServer('getAppConfig');
+        state.config = config;
+        renderConfig(config);
+      } catch (error) {
+        renderConfig({ configured: false, message: 'Offline or unable to contact Apps Script backend.' });
+        if (showErrors !== false) {
+          showToast('Could not check backend status: ' + error.message, true);
+        }
+      }
+    }
+
+    function renderConfig(config) {
+      const panel = $('configPanel');
+
+      if (!config || !config.configured) {
+        panel.innerHTML = '';
+        panel.appendChild(infoItem('Status', (config && config.message) || 'Not initialized'));
+        panel.appendChild(infoItem('Action', 'Click Initialize Database while online.'));
+        return;
+      }
+
+      panel.innerHTML = '';
+      panel.appendChild(infoItem('Status', 'Ready'));
+      panel.appendChild(linkInfoItem('Spreadsheet', config.spreadsheetUrl, 'Open Google Sheet'));
+      panel.appendChild(linkInfoItem('Image Folder', config.folderUrl, 'Open Drive Folder'));
+      panel.appendChild(infoItem('Rows', String(config.rowCount || 0)));
+    }
+
+    function infoItem(label, value) {
+      const item = document.createElement('div');
+      item.className = 'info-item';
+      item.innerHTML = '<small></small><strong></strong>';
+      item.querySelector('small').textContent = label;
+      item.querySelector('strong').textContent = value;
+      return item;
+    }
+
+    function linkInfoItem(label, href, text) {
+      const item = document.createElement('div');
+      item.className = 'info-item';
+      const small = document.createElement('small');
+      small.textContent = label;
+      const link = document.createElement('a');
+      link.href = href || '#';
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.textContent = text;
+      item.appendChild(small);
+      item.appendChild(link);
+      return item;
+    }
+
+    async function refreshQueueStats() {
+      const records = await getAllRecords();
+      const pending = records.filter((record) => record.status === 'pending' || record.status === 'syncing');
+      const synced = records.filter((record) => record.status === 'synced' || record.status === 'duplicate');
+      const errors = records.filter((record) => record.status === 'error');
+
+      $('pendingCount').textContent = pending.length;
+      $('syncedCount').textContent = synced.length;
+      $('errorCount').textContent = errors.length;
+
+      renderQueue(records);
+    }
+
+    function renderQueue(records) {
+      const list = $('queueList');
+      const sorted = records.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+      list.innerHTML = '';
+
+      if (sorted.length === 0) {
+        list.className = 'queue-list empty';
+        list.textContent = 'No local records yet.';
+        return;
+      }
+
+      list.className = 'queue-list';
+
+      sorted.slice(0, 25).forEach((record) => {
+        const card = document.createElement('article');
+        card.className = 'record-card';
+
+        const details = document.createElement('div');
+        const title = document.createElement('h3');
+        title.textContent = record.name + ' • ' + record.classCode;
+        const meta = document.createElement('p');
+        meta.textContent = [
+          record.title,
+          record.clientTimestamp ? new Date(record.clientTimestamp).toLocaleString() : '',
+          formatBytes(record.compressedSize || 0),
+          record.attempts ? record.attempts + ' attempt' + (record.attempts === 1 ? '' : 's') : ''
+        ].filter(Boolean).join(' • ');
+        details.appendChild(title);
+        details.appendChild(meta);
+
+        if (record.lastError) {
+          const error = document.createElement('p');
+          error.textContent = 'Error: ' + record.lastError;
+          error.style.color = 'var(--danger)';
+          details.appendChild(error);
+        }
+
+        const badge = document.createElement('span');
+        badge.className = 'status-badge ' + (record.status || 'pending');
+        badge.textContent = record.status || 'pending';
+
+        card.appendChild(details);
+        card.appendChild(badge);
+        list.appendChild(card);
+      });
+    }
+
+    async function clearSyncedRecords() {
+      const records = await getAllRecords();
+      const synced = records.filter((record) => record.status === 'synced' || record.status === 'duplicate');
+
+      for (const record of synced) {
+        await deleteRecord(record.id);
+      }
+
+      await refreshQueueStats();
+      showToast('Cleared ' + synced.length + ' synced local record' + (synced.length === 1 ? '' : 's') + '.');
+    }
+
+    async function loadRecentRecords() {
+      if (!navigator.onLine) {
+        showToast('Recent Google Sheets rows require internet connection.', true);
+        return;
+      }
+
+      $('recentBtn').disabled = true;
+      $('recentBtn').textContent = 'Loading...';
+
+      try {
+        const rows = await runServer('listRecentAttendance', [20]);
+        renderRecentRecords(rows || []);
+        $('recentPanel').hidden = false;
+      } catch (error) {
+        showToast('Could not load recent rows: ' + error.message, true);
+      } finally {
+        $('recentBtn').disabled = false;
+        $('recentBtn').textContent = 'Load Recent Sheet Rows';
+      }
+    }
+
+    function renderRecentRecords(rows) {
+      const list = $('recentList');
+      list.innerHTML = '';
+
+      if (rows.length === 0) {
+        list.textContent = 'No synced rows yet.';
+        return;
+      }
+
+      rows.forEach((row) => {
+        const card = document.createElement('article');
+        card.className = 'record-card';
+
+        const details = document.createElement('div');
+        const title = document.createElement('h3');
+        title.textContent = row.name + ' • ' + row.classCode;
+        const meta = document.createElement('p');
+        meta.textContent = [
+          row.title,
+          row.serverTimestamp,
+          row.compressedSize ? formatBytes(row.compressedSize) : '',
+          row.compressionRatio ? 'ratio ' + row.compressionRatio : ''
+        ].filter(Boolean).join(' • ');
+        details.appendChild(title);
+        details.appendChild(meta);
+
+        if (row.imageUrl) {
+          const link = document.createElement('a');
+          link.href = row.imageUrl;
+          link.target = '_blank';
+          link.rel = 'noopener';
+          link.textContent = 'Open image in Drive';
+          details.appendChild(link);
+        }
+
+        const badge = document.createElement('span');
+        badge.className = 'status-badge synced';
+        badge.textContent = 'sheet';
+
+        card.appendChild(details);
+        card.appendChild(badge);
+        list.appendChild(card);
+      });
+    }
+
+    function runServer(functionName, args) {
+      return new Promise((resolve, reject) => {
+        if (!window.google || !google.script || !google.script.run) {
+          reject(new Error('Apps Script runtime is not available.'));
+          return;
+        }
+
+        const runner = google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler((error) => {
+            reject(new Error(error && error.message ? error.message : String(error)));
+          });
+
+        if (!Array.isArray(args)) {
+          args = [];
+        }
+
+        runner[functionName].apply(runner, args);
+      });
+    }
+
+    function updateConnectionStatus() {
+      const online = navigator.onLine;
+      const dot = $('connectionDot');
+      dot.classList.toggle('online', online);
+      dot.classList.toggle('offline', !online);
+      $('connectionLabel').textContent = online ? 'Online' : 'Offline';
+      $('connectionDetail').textContent = online
+        ? 'Records can sync to Google Sheets.'
+        : 'Records will remain in the local queue.';
+    }
+
+    function showToast(message, isError) {
+      const toast = $('toast');
+      toast.textContent = message;
+      toast.hidden = false;
+      toast.style.background = isError ? '#991b1b' : '#111827';
+
+      if (state.toastTimer) {
+        window.clearTimeout(state.toastTimer);
+      }
+
+      state.toastTimer = window.setTimeout(() => {
+        toast.hidden = true;
+      }, isError ? 6500 : 4200);
+    }
+
+    function createUuid() {
+      if (window.crypto && crypto.randomUUID) {
+        return crypto.randomUUID();
+      }
+
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(char) {
+        const random = Math.random() * 16 | 0;
+        const value = char === 'x' ? random : (random & 0x3 | 0x8);
+        return value.toString(16);
+      });
+    }
+
+    function formatBytes(bytes) {
+      const value = Number(bytes) || 0;
+      if (value < 1024) return value + ' B';
+      if (value < 1024 * 1024) return (value / 1024).toFixed(1) + ' KB';
+      return (value / (1024 * 1024)).toFixed(2) + ' MB';
+    }
+  })();
+</script>

@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <base target="_top">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#2563eb">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Attendance">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <? var webAppUrl = getWebAppUrl_(); ?>
+    <? if (webAppUrl) { ?>
+      <link rel="manifest" href="<?= webAppUrl ?>?route=manifest">
+    <? } ?>
+    <title>Attendance Capture</title>
+    <?!= include('Styles'); ?>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Offline-capable Apps Script web app</p>
+          <h1>Attendance Capture</h1>
+          <p class="hero-copy">
+            Save name, class code, title, and a compressed image locally first. When internet is available, records sync to Google Sheets and images upload to Drive.
+          </p>
+        </div>
+        <div class="status-card" aria-live="polite">
+          <span id="connectionDot" class="dot"></span>
+          <div>
+            <strong id="connectionLabel">Checking connection</strong>
+            <span id="connectionDetail">Preparing app...</span>
+          </div>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="panel capture-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">New record</p>
+              <h2>Capture attendance</h2>
+            </div>
+            <button id="setupBtn" type="button" class="button button-secondary">Initialize Database</button>
+          </div>
+
+          <form id="attendanceForm" class="form-grid">
+            <label>
+              <span>Name</span>
+              <input id="nameInput" name="name" type="text" autocomplete="name" placeholder="Juan Dela Cruz" required>
+            </label>
+
+            <label>
+              <span>Class Code</span>
+              <input id="classCodeInput" name="classCode" type="text" autocomplete="off" placeholder="CE-101 / PHY-1A" required>
+            </label>
+
+            <label class="span-2">
+              <span>Title</span>
+              <input id="titleInput" name="title" type="text" autocomplete="off" placeholder="Lecture 01 / Site Visit / Lab Attendance" required>
+            </label>
+
+            <label class="span-2 file-input">
+              <span>Image</span>
+              <input id="imageInput" name="image" type="file" accept="image/*" capture="environment" required>
+              <small>Images are compressed in the browser before being queued or uploaded.</small>
+            </label>
+
+            <div class="compression-options span-2">
+              <label>
+                <span>Max image dimension</span>
+                <select id="maxDimensionInput">
+                  <option value="960">960 px - smallest</option>
+                  <option value="1280" selected>1280 px - recommended</option>
+                  <option value="1600">1600 px - clearer</option>
+                </select>
+              </label>
+
+              <label>
+                <span>JPEG quality</span>
+                <select id="qualityInput">
+                  <option value="0.55">55% - high compression</option>
+                  <option value="0.7" selected>70% - recommended</option>
+                  <option value="0.82">82% - higher quality</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="preview span-2" id="previewPanel" hidden>
+              <img id="imagePreview" alt="Selected attendance image preview">
+              <div>
+                <strong>Image preview</strong>
+                <p id="imageMeta">Waiting for image...</p>
+              </div>
+            </div>
+
+            <div class="actions span-2">
+              <button id="saveBtn" type="submit" class="button button-primary">Save to Offline Queue</button>
+              <button id="syncBtn" type="button" class="button button-secondary">Sync Now</button>
+            </div>
+          </form>
+        </section>
+
+        <aside class="panel sidebar-panel">
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">Database</p>
+              <h2>Setup status</h2>
+            </div>
+          </div>
+          <div id="configPanel" class="info-list">
+            <p class="muted">Checking database status...</p>
+          </div>
+
+          <hr>
+
+          <div class="stats-grid">
+            <div>
+              <span id="pendingCount">0</span>
+              <small>Pending</small>
+            </div>
+            <div>
+              <span id="syncedCount">0</span>
+              <small>Synced locally</small>
+            </div>
+            <div>
+              <span id="errorCount">0</span>
+              <small>Errors</small>
+            </div>
+          </div>
+
+          <div class="button-row">
+            <button id="clearSyncedBtn" type="button" class="button button-ghost">Clear Synced Local Copies</button>
+            <button id="recentBtn" type="button" class="button button-ghost">Load Recent Sheet Rows</button>
+          </div>
+        </aside>
+      </main>
+
+      <section class="panel queue-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Local device queue</p>
+            <h2>Sync queue</h2>
+          </div>
+          <span id="lastSyncLabel" class="pill">No sync yet</span>
+        </div>
+        <div id="queueList" class="queue-list empty">No local records yet.</div>
+      </section>
+
+      <section class="panel recent-panel" id="recentPanel" hidden>
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Google Sheets</p>
+            <h2>Recent synced records</h2>
+          </div>
+        </div>
+        <div id="recentList" class="recent-list"></div>
+      </section>
+
+      <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    </div>
+
+    <?!= include('Client'); ?>
+  </body>
+</html>

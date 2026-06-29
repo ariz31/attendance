@@ -1,0 +1,797 @@
+<script>
+  (function() {
+    'use strict';
+
+    const STORAGE_KEYS = {
+      draft: 'attendance.seatingDraft.v1',
+      absenceQueue: 'attendance.seatingAbsenceQueue.v1',
+      deviceId: 'attendance.seatingDeviceId.v1'
+    };
+
+    const seatState = {
+      id: '',
+      title: '',
+      rows: 0,
+      columns: 0,
+      seats: {},
+      selectedKey: '',
+      absentMode: false,
+      saving: false,
+      syncingAbsences: false
+    };
+
+    const $seat = (id) => document.getElementById(id);
+
+    document.addEventListener('DOMContentLoaded', initSeatingMaker);
+
+    function initSeatingMaker() {
+      const root = $seat('seatingPanel');
+      if (!root) return;
+
+      bindSeatingEvents();
+      loadSeatingDraft();
+      renderSeatingGrid();
+      renderAbsenceQueue();
+
+      if (navigator.onLine) {
+        loadSavedSeatingPlans(false);
+        syncAbsenceQueue(false);
+      }
+
+      window.addEventListener('online', function() {
+        syncAbsenceQueue(false);
+      });
+    }
+
+    function bindSeatingEvents() {
+      $seat('createSeatingBtn').addEventListener('click', createOrResizeSeatingGrid);
+      $seat('saveSeatingBtn').addEventListener('click', saveSeatingArrangement);
+      $seat('loadSeatingPlansBtn').addEventListener('click', function() { loadSavedSeatingPlans(true); });
+      $seat('savedSeatingPlans').addEventListener('change', loadSelectedSeatingPlan);
+      $seat('markAbsentModeBtn').addEventListener('click', toggleAbsentMode);
+      $seat('saveSeatBtn').addEventListener('click', saveSelectedSeat);
+      $seat('clearSeatBtn').addEventListener('click', clearSelectedSeat);
+      $seat('seatPhotoInput').addEventListener('change', previewSeatPhoto);
+      $seat('syncAbsencesBtn').addEventListener('click', function() { syncAbsenceQueue(true); });
+      $seat('clearSyncedAbsencesBtn').addEventListener('click', clearSyncedAbsences);
+    }
+
+    function createOrResizeSeatingGrid() {
+      const rows = clampNumber($seat('seatingRowsInput').value, 1, 20, 5);
+      const columns = clampNumber($seat('seatingColumnsInput').value, 1, 20, 5);
+      const title = ($seat('seatingTitleInput').value || 'Class Seating Plan').trim();
+
+      if (rows * columns > 250) {
+        seatingToast('Maximum layout size is 250 seats.', true);
+        return;
+      }
+
+      seatState.id = seatState.id || createUuid();
+      seatState.title = title;
+      seatState.rows = rows;
+      seatState.columns = columns;
+
+      Object.keys(seatState.seats).forEach(function(key) {
+        const seat = seatState.seats[key];
+        if (seat.row > rows || seat.column > columns) {
+          delete seatState.seats[key];
+        }
+      });
+
+      seatState.selectedKey = '';
+      saveSeatingDraft();
+      renderSeatingGrid();
+      renderSeatEditor();
+      seatingToast('Seating grid created. Click a location to edit it.');
+    }
+
+    function renderSeatingGrid() {
+      const grid = $seat('seatingGrid');
+      grid.innerHTML = '';
+
+      if (!seatState.rows || !seatState.columns) {
+        grid.className = 'seating-placeholder';
+        grid.textContent = 'Enter a row and column count, then click Create / Resize Grid.';
+        return;
+      }
+
+      grid.className = 'seating-grid';
+      grid.style.gridTemplateColumns = 'repeat(' + seatState.columns + ', minmax(112px, 1fr))';
+
+      const absentSeatKeys = getAbsentSeatKeys();
+
+      for (let row = 1; row <= seatState.rows; row += 1) {
+        for (let column = 1; column <= seatState.columns; column += 1) {
+          const key = seatKey(row, column);
+          const seat = seatState.seats[key] || emptySeat(row, column);
+          const isOccupied = Boolean(seat.nickname || seat.studentName || seat.imageBase64 || seat.imageUrl);
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = [
+            'seat-card',
+            isOccupied ? 'occupied' : 'empty',
+            seatState.selectedKey === key ? 'selected' : '',
+            absentSeatKeys[key] ? 'absent' : ''
+          ].filter(Boolean).join(' ');
+          button.setAttribute('aria-label', 'Seat row ' + row + ', column ' + column);
+          button.addEventListener('click', function() {
+            if (seatState.absentMode) {
+              markSeatAbsent(key);
+            } else {
+              selectSeat(key);
+            }
+          });
+
+          const avatar = document.createElement('div');
+          avatar.className = 'seat-avatar';
+          const photo = seat.imageBase64 || seat.imageUrl;
+
+          if (photo) {
+            const image = document.createElement('img');
+            image.src = photo;
+            image.alt = (seat.nickname || seat.studentName || 'Student') + ' photo';
+            avatar.appendChild(image);
+          } else {
+            avatar.textContent = initials(seat.nickname || seat.studentName || 'Seat');
+          }
+
+          const nickname = document.createElement('div');
+          nickname.className = 'seat-nickname';
+          nickname.textContent = seat.nickname || 'Empty seat';
+
+          const name = document.createElement('div');
+          name.className = 'seat-name';
+          name.textContent = seat.studentName || (isOccupied ? 'No full name' : 'Click to assign');
+
+          const position = document.createElement('div');
+          position.className = 'seat-position';
+          position.textContent = 'R' + row + ' • C' + column;
+
+          const absent = document.createElement('span');
+          absent.className = 'seat-absent-mark';
+          absent.textContent = 'Absent';
+
+          button.appendChild(absent);
+          button.appendChild(avatar);
+          button.appendChild(nickname);
+          button.appendChild(name);
+          button.appendChild(position);
+          grid.appendChild(button);
+        }
+      }
+    }
+
+    function selectSeat(key) {
+      seatState.selectedKey = key;
+      renderSeatingGrid();
+      renderSeatEditor();
+    }
+
+    function renderSeatEditor() {
+      const editor = $seat('seatEditor');
+
+      if (!seatState.selectedKey) {
+        editor.hidden = true;
+        return;
+      }
+
+      const seat = seatState.seats[seatState.selectedKey] || emptySeatFromKey(seatState.selectedKey);
+      editor.hidden = false;
+      $seat('selectedSeatLabel').textContent = 'Row ' + seat.row + ', Column ' + seat.column;
+      $seat('seatNicknameInput').value = seat.nickname || '';
+      $seat('seatNameInput').value = seat.studentName || '';
+      $seat('seatPhotoInput').value = '';
+      renderSeatPhotoPreview(seat.imageBase64 || seat.imageUrl, seat);
+    }
+
+    async function saveSelectedSeat() {
+      if (!seatState.selectedKey) {
+        seatingToast('Select a seat first.', true);
+        return;
+      }
+
+      const baseSeat = seatState.seats[seatState.selectedKey] || emptySeatFromKey(seatState.selectedKey);
+      const nickname = ($seat('seatNicknameInput').value || '').trim();
+      const studentName = ($seat('seatNameInput').value || '').trim();
+      const photoFile = $seat('seatPhotoInput').files[0];
+      const nextSeat = Object.assign({}, baseSeat, { nickname, studentName });
+
+      if (!nickname && !studentName && !photoFile && !nextSeat.imageBase64 && !nextSeat.imageUrl) {
+        seatingToast('Add a nickname, student name, or photo before saving the seat.', true);
+        return;
+      }
+
+      $seat('saveSeatBtn').disabled = true;
+      $seat('saveSeatBtn').textContent = 'Saving seat...';
+
+      try {
+        if (photoFile) {
+          const compressed = await compressSeatImage(photoFile, 360, 0.68);
+          nextSeat.imageBase64 = await blobToDataUrl(compressed.blob);
+          nextSeat.mimeType = compressed.blob.type || 'image/jpeg';
+          nextSeat.sourceFileName = photoFile.name || 'seat-photo.jpg';
+          nextSeat.originalSize = photoFile.size || 0;
+          nextSeat.compressedSize = compressed.blob.size || 0;
+          nextSeat.imageFileId = '';
+          nextSeat.imageUrl = '';
+        }
+
+        seatState.seats[seatState.selectedKey] = nextSeat;
+        saveSeatingDraft();
+        renderSeatingGrid();
+        renderSeatEditor();
+        seatingToast('Seat updated locally. Save the arrangement to sync it.');
+      } catch (error) {
+        seatingToast(error.message, true);
+      } finally {
+        $seat('saveSeatBtn').disabled = false;
+        $seat('saveSeatBtn').textContent = 'Save Seat';
+      }
+    }
+
+    function clearSelectedSeat() {
+      if (!seatState.selectedKey) return;
+      delete seatState.seats[seatState.selectedKey];
+      saveSeatingDraft();
+      renderSeatingGrid();
+      renderSeatEditor();
+      seatingToast('Seat cleared locally. Save the arrangement to sync the change.');
+    }
+
+    async function previewSeatPhoto(event) {
+      const file = event.target.files[0];
+      if (!file) {
+        renderSeatEditor();
+        return;
+      }
+
+      if (!file.type || !file.type.startsWith('image/')) {
+        seatingToast('Seat photo must be an image.', true);
+        event.target.value = '';
+        return;
+      }
+
+      try {
+        const compressed = await compressSeatImage(file, 360, 0.68);
+        const url = await blobToDataUrl(compressed.blob);
+        renderSeatPhotoPreview(url, {
+          sourceFileName: file.name,
+          originalSize: file.size,
+          compressedSize: compressed.blob.size
+        });
+      } catch (error) {
+        seatingToast(error.message, true);
+      }
+    }
+
+    function renderSeatPhotoPreview(src, seat) {
+      const preview = $seat('seatPhotoPreview');
+      const img = $seat('seatPhotoPreviewImg');
+      const meta = $seat('seatPhotoPreviewMeta');
+
+      if (!src) {
+        preview.hidden = true;
+        img.removeAttribute('src');
+        meta.textContent = '';
+        return;
+      }
+
+      img.src = src;
+      preview.hidden = false;
+      meta.textContent = [
+        seat.sourceFileName || 'Seat photo',
+        seat.compressedSize ? formatBytes(seat.compressedSize) : '',
+        seat.originalSize ? 'original ' + formatBytes(seat.originalSize) : ''
+      ].filter(Boolean).join(' • ');
+    }
+
+    async function saveSeatingArrangement() {
+      if (!seatState.rows || !seatState.columns) {
+        seatingToast('Create a seating grid before saving.', true);
+        return;
+      }
+
+      if (!navigator.onLine) {
+        seatingToast('The seating plan is saved locally. Go online to sync it to Sheets and Drive.', true);
+        saveSeatingDraft();
+        return;
+      }
+
+      seatState.title = ($seat('seatingTitleInput').value || seatState.title || 'Class Seating Plan').trim();
+      seatState.id = seatState.id || createUuid();
+      seatState.saving = true;
+      $seat('saveSeatingBtn').disabled = true;
+      $seat('saveSeatingBtn').textContent = 'Saving...';
+
+      try {
+        const deviceId = getSeatingDeviceId();
+        const seats = Object.keys(seatState.seats).map(function(key) {
+          const seat = seatState.seats[key];
+          return {
+            seatId: seat.seatId,
+            row: seat.row,
+            column: seat.column,
+            nickname: seat.nickname || '',
+            studentName: seat.studentName || '',
+            imageBase64: seat.imageBase64 || '',
+            imageFileId: seat.imageFileId || '',
+            imageUrl: seat.imageUrl || '',
+            mimeType: seat.mimeType || 'image/jpeg',
+            sourceFileName: seat.sourceFileName || '',
+            originalSize: seat.originalSize || 0,
+            compressedSize: seat.compressedSize || 0
+          };
+        });
+
+        const response = await runSeatingServer('saveSeatingArrangement', [{
+          id: seatState.id,
+          title: seatState.title,
+          rows: seatState.rows,
+          columns: seatState.columns,
+          deviceId,
+          seats
+        }]);
+
+        if (!response || !response.ok) {
+          throw new Error('Seating arrangement was not saved.');
+        }
+
+        Object.keys(seatState.seats).forEach(function(key) {
+          const seat = seatState.seats[key];
+          if (seat.imageBase64) {
+            seat.syncedWithPhoto = true;
+          }
+        });
+
+        saveSeatingDraft();
+        seatingToast('Seating arrangement synced: ' + response.savedSeats + ' occupied seat(s).');
+        await loadSavedSeatingPlans(false);
+      } catch (error) {
+        seatingToast('Could not save seating arrangement: ' + error.message, true);
+      } finally {
+        seatState.saving = false;
+        $seat('saveSeatingBtn').disabled = false;
+        $seat('saveSeatingBtn').textContent = 'Save Seating Arrangement';
+      }
+    }
+
+    async function loadSavedSeatingPlans(showToast) {
+      if (!navigator.onLine) {
+        if (showToast) seatingToast('Go online to load saved seating plans.', true);
+        return;
+      }
+
+      try {
+        const plans = await runSeatingServer('listSeatingArrangements', [50]);
+        const select = $seat('savedSeatingPlans');
+        const current = select.value;
+        select.innerHTML = '<option value="">Select saved plan...</option>';
+
+        (plans || []).forEach(function(plan) {
+          const option = document.createElement('option');
+          option.value = plan.id;
+          option.textContent = plan.title + ' • ' + plan.rows + '×' + plan.columns + ' • ' + plan.seatCount + ' students';
+          select.appendChild(option);
+        });
+
+        if (current) select.value = current;
+        if (showToast) seatingToast('Loaded ' + (plans || []).length + ' seating plan(s).');
+      } catch (error) {
+        if (showToast) seatingToast('Could not load seating plans: ' + error.message, true);
+      }
+    }
+
+    async function loadSelectedSeatingPlan() {
+      const id = $seat('savedSeatingPlans').value;
+      if (!id) return;
+
+      try {
+        const plan = await runSeatingServer('getSeatingArrangement', [id]);
+        seatState.id = plan.id;
+        seatState.title = plan.title;
+        seatState.rows = Number(plan.rows) || 1;
+        seatState.columns = Number(plan.columns) || 1;
+        seatState.seats = {};
+        seatState.selectedKey = '';
+
+        (plan.seats || []).forEach(function(seat) {
+          const key = seatKey(seat.row, seat.column);
+          seatState.seats[key] = {
+            seatId: seat.seatId || key,
+            row: Number(seat.row),
+            column: Number(seat.column),
+            nickname: seat.nickname || '',
+            studentName: seat.studentName || '',
+            imageBase64: '',
+            imageFileId: seat.imageFileId || '',
+            imageUrl: seat.imageUrl || '',
+            mimeType: seat.mimeType || '',
+            sourceFileName: seat.sourceFileName || '',
+            originalSize: seat.originalSize || 0,
+            compressedSize: seat.compressedSize || 0
+          };
+        });
+
+        $seat('seatingTitleInput').value = seatState.title;
+        $seat('seatingRowsInput').value = seatState.rows;
+        $seat('seatingColumnsInput').value = seatState.columns;
+        saveSeatingDraft();
+        renderSeatingGrid();
+        renderSeatEditor();
+        seatingToast('Seating plan loaded.');
+      } catch (error) {
+        seatingToast('Could not load seating plan: ' + error.message, true);
+      }
+    }
+
+    function toggleAbsentMode() {
+      seatState.absentMode = !seatState.absentMode;
+      const btn = $seat('markAbsentModeBtn');
+      btn.classList.toggle('mode-active', seatState.absentMode);
+      btn.textContent = seatState.absentMode ? 'Absent Mode: ON' : 'Absent Mode: OFF';
+      seatingToast(seatState.absentMode ? 'Click a student seat to mark absent.' : 'Edit mode restored.');
+    }
+
+    function markSeatAbsent(key) {
+      const seat = seatState.seats[key];
+
+      if (!seat || (!seat.nickname && !seat.studentName)) {
+        seatingToast('Assign a student before marking a seat absent.', true);
+        return;
+      }
+
+      const absence = {
+        id: createUuid(),
+        arrangementId: seatState.id || createUuid(),
+        arrangementTitle: seatState.title || $seat('seatingTitleInput').value || 'Class Seating Plan',
+        seatId: seat.seatId,
+        row: seat.row,
+        column: seat.column,
+        nickname: seat.nickname || '',
+        studentName: seat.studentName || '',
+        deviceId: getSeatingDeviceId(),
+        clientTimestamp: new Date().toISOString(),
+        notes: '',
+        status: 'pending'
+      };
+
+      if (!seatState.id) {
+        seatState.id = absence.arrangementId;
+      }
+
+      const queue = getAbsenceQueue();
+      queue.unshift(absence);
+      saveAbsenceQueue(queue);
+      renderAbsenceQueue();
+      renderSeatingGrid();
+      seatingToast((absence.nickname || absence.studentName) + ' marked absent locally.');
+
+      if (navigator.onLine) {
+        syncAbsenceQueue(false);
+      }
+    }
+
+    async function syncAbsenceQueue(showToast) {
+      if (seatState.syncingAbsences) return;
+
+      const queue = getAbsenceQueue();
+      const pending = queue.filter(function(item) { return item.status === 'pending' || item.status === 'error'; });
+
+      if (pending.length === 0) {
+        if (showToast) seatingToast('No pending absences to sync.');
+        renderAbsenceQueue();
+        return;
+      }
+
+      if (!navigator.onLine) {
+        if (showToast) seatingToast('Go online to sync absence records.', true);
+        renderAbsenceQueue();
+        return;
+      }
+
+      seatState.syncingAbsences = true;
+      $seat('syncAbsencesBtn').disabled = true;
+      $seat('syncAbsencesBtn').textContent = 'Syncing...';
+
+      try {
+        const response = await runSeatingServer('recordSeatingAbsences', [pending]);
+        const results = response && response.results ? response.results : [];
+        const resultById = {};
+        results.forEach(function(result) { resultById[result.id] = result; });
+
+        const updated = queue.map(function(item) {
+          const result = resultById[item.id];
+          if (!result) return item;
+          if (result.status === 'synced' || result.status === 'duplicate') {
+            return Object.assign({}, item, { status: result.status, syncedAt: new Date().toISOString(), lastError: '' });
+          }
+          return Object.assign({}, item, { status: 'error', lastError: result.message || 'Sync failed.' });
+        });
+
+        saveAbsenceQueue(updated);
+        renderAbsenceQueue();
+        renderSeatingGrid();
+        if (showToast || response.saved > 0) seatingToast('Synced ' + response.saved + ' absence record(s).');
+      } catch (error) {
+        const failed = queue.map(function(item) {
+          if (item.status === 'pending') {
+            return Object.assign({}, item, { status: 'error', lastError: error.message });
+          }
+          return item;
+        });
+        saveAbsenceQueue(failed);
+        renderAbsenceQueue();
+        if (showToast) seatingToast('Could not sync absences: ' + error.message, true);
+      } finally {
+        seatState.syncingAbsences = false;
+        $seat('syncAbsencesBtn').disabled = false;
+        $seat('syncAbsencesBtn').textContent = 'Sync Absences';
+      }
+    }
+
+    function renderAbsenceQueue() {
+      const list = $seat('absenceQueueList');
+      const queue = getAbsenceQueue();
+      list.innerHTML = '';
+
+      if (queue.length === 0) {
+        list.className = 'absence-list empty';
+        list.textContent = 'No absence clicks yet.';
+        return;
+      }
+
+      list.className = 'absence-list';
+
+      queue.slice(0, 20).forEach(function(item) {
+        const row = document.createElement('div');
+        row.className = 'absence-item';
+
+        const details = document.createElement('div');
+        const title = document.createElement('strong');
+        title.textContent = item.nickname || item.studentName || item.seatId;
+        const meta = document.createElement('small');
+        meta.textContent = [
+          item.arrangementTitle,
+          'R' + item.row + ' C' + item.column,
+          item.clientTimestamp ? new Date(item.clientTimestamp).toLocaleString() : ''
+        ].filter(Boolean).join(' • ');
+        details.appendChild(title);
+        details.appendChild(meta);
+
+        if (item.lastError) {
+          const error = document.createElement('small');
+          error.textContent = item.lastError;
+          error.style.color = 'var(--danger)';
+          details.appendChild(error);
+        }
+
+        const badge = document.createElement('span');
+        badge.className = 'status-badge ' + (item.status || 'pending');
+        badge.textContent = item.status || 'pending';
+
+        row.appendChild(details);
+        row.appendChild(badge);
+        list.appendChild(row);
+      });
+    }
+
+    function clearSyncedAbsences() {
+      const queue = getAbsenceQueue();
+      const remaining = queue.filter(function(item) {
+        return item.status !== 'synced' && item.status !== 'duplicate';
+      });
+      saveAbsenceQueue(remaining);
+      renderAbsenceQueue();
+      renderSeatingGrid();
+      seatingToast('Cleared synced absence copies from this device.');
+    }
+
+    function getAbsentSeatKeys() {
+      const result = {};
+      getAbsenceQueue().forEach(function(item) {
+        if (item.arrangementId === seatState.id && (item.status === 'pending' || item.status === 'synced' || item.status === 'duplicate')) {
+          result[seatKey(item.row, item.column)] = true;
+        }
+      });
+      return result;
+    }
+
+    function saveSeatingDraft() {
+      try {
+        localStorage.setItem(STORAGE_KEYS.draft, JSON.stringify({
+          id: seatState.id,
+          title: seatState.title,
+          rows: seatState.rows,
+          columns: seatState.columns,
+          seats: seatState.seats
+        }));
+      } catch (error) {
+        seatingToast('Local draft storage is full. Save to backend soon.', true);
+      }
+    }
+
+    function loadSeatingDraft() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEYS.draft);
+        if (!raw) return;
+        const draft = JSON.parse(raw);
+        seatState.id = draft.id || '';
+        seatState.title = draft.title || '';
+        seatState.rows = Number(draft.rows) || 0;
+        seatState.columns = Number(draft.columns) || 0;
+        seatState.seats = draft.seats || {};
+
+        if (seatState.title) $seat('seatingTitleInput').value = seatState.title;
+        if (seatState.rows) $seat('seatingRowsInput').value = seatState.rows;
+        if (seatState.columns) $seat('seatingColumnsInput').value = seatState.columns;
+      } catch (error) {
+        localStorage.removeItem(STORAGE_KEYS.draft);
+      }
+    }
+
+    function getAbsenceQueue() {
+      try {
+        return JSON.parse(localStorage.getItem(STORAGE_KEYS.absenceQueue) || '[]');
+      } catch (error) {
+        return [];
+      }
+    }
+
+    function saveAbsenceQueue(queue) {
+      localStorage.setItem(STORAGE_KEYS.absenceQueue, JSON.stringify(queue));
+    }
+
+    function getSeatingDeviceId() {
+      let id = localStorage.getItem(STORAGE_KEYS.deviceId);
+      if (!id) {
+        id = 'seat-device-' + createUuid();
+        localStorage.setItem(STORAGE_KEYS.deviceId, id);
+      }
+      return id;
+    }
+
+    function seatKey(row, column) {
+      return 'R' + row + 'C' + column;
+    }
+
+    function emptySeat(row, column) {
+      return {
+        seatId: seatKey(row, column),
+        row,
+        column,
+        nickname: '',
+        studentName: '',
+        imageBase64: '',
+        imageFileId: '',
+        imageUrl: '',
+        mimeType: '',
+        sourceFileName: '',
+        originalSize: 0,
+        compressedSize: 0
+      };
+    }
+
+    function emptySeatFromKey(key) {
+      const match = String(key).match(/^R(\d+)C(\d+)$/);
+      const row = match ? Number(match[1]) : 1;
+      const column = match ? Number(match[2]) : 1;
+      return emptySeat(row, column);
+    }
+
+    function clampNumber(value, min, max, fallback) {
+      const number = Math.floor(Number(value));
+      if (!Number.isFinite(number)) return fallback;
+      return Math.min(max, Math.max(min, number));
+    }
+
+    function initials(value) {
+      const parts = String(value || '')
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .slice(0, 2);
+      return parts.map(function(part) { return part[0].toUpperCase(); }).join('') || '+';
+    }
+
+    async function compressSeatImage(file, maxDimension, quality) {
+      const image = await loadSeatImage(file);
+      const sourceWidth = image.naturalWidth || image.width;
+      const sourceHeight = image.naturalHeight || image.height;
+      const scale = Math.min(1, maxDimension / Math.max(sourceWidth, sourceHeight));
+      const width = Math.max(1, Math.round(sourceWidth * scale));
+      const height = Math.max(1, Math.round(sourceHeight * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d', { alpha: false });
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(image, 0, 0, width, height);
+
+      const blob = await new Promise(function(resolve, reject) {
+        canvas.toBlob(function(result) {
+          if (result) resolve(result);
+          else reject(new Error('Seat photo compression failed.'));
+        }, 'image/jpeg', quality);
+      });
+
+      if (blob.size > 2 * 1024 * 1024) {
+        throw new Error('Compressed seat photo is too large.');
+      }
+
+      return { blob, width, height };
+    }
+
+    function loadSeatImage(file) {
+      return new Promise(function(resolve, reject) {
+        const url = URL.createObjectURL(file);
+        const image = new Image();
+        image.onload = function() {
+          URL.revokeObjectURL(url);
+          resolve(image);
+        };
+        image.onerror = function() {
+          URL.revokeObjectURL(url);
+          reject(new Error('Could not read selected seat photo.'));
+        };
+        image.src = url;
+      });
+    }
+
+    function blobToDataUrl(blob) {
+      return new Promise(function(resolve, reject) {
+        const reader = new FileReader();
+        reader.onload = function() { resolve(reader.result); };
+        reader.onerror = function() { reject(reader.error || new Error('Could not encode seat photo.')); };
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    function runSeatingServer(functionName, args) {
+      return new Promise(function(resolve, reject) {
+        if (!window.google || !google.script || !google.script.run) {
+          reject(new Error('Apps Script runtime is not available.'));
+          return;
+        }
+
+        const runner = google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(function(error) {
+            reject(new Error(error && error.message ? error.message : String(error)));
+          });
+
+        runner[functionName].apply(runner, Array.isArray(args) ? args : []);
+      });
+    }
+
+    function seatingToast(message, isError) {
+      const toast = $seat('toast');
+      if (!toast) return;
+      toast.textContent = message;
+      toast.hidden = false;
+      toast.style.background = isError ? '#991b1b' : '#111827';
+      window.clearTimeout(seatingToast.timer);
+      seatingToast.timer = window.setTimeout(function() {
+        toast.hidden = true;
+      }, isError ? 6500 : 4200);
+    }
+
+    function createUuid() {
+      if (window.crypto && crypto.randomUUID) {
+        return crypto.randomUUID();
+      }
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(char) {
+        const random = Math.random() * 16 | 0;
+        const value = char === 'x' ? random : (random & 0x3 | 0x8);
+        return value.toString(16);
+      });
+    }
+
+    function formatBytes(bytes) {
+      const value = Number(bytes) || 0;
+      if (value < 1024) return value + ' B';
+      if (value < 1024 * 1024) return (value / 1024).toFixed(1) + ' KB';
+      return (value / (1024 * 1024)).toFixed(2) + ' MB';
+    }
+  })();
+</script>

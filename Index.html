@@ -14,6 +14,7 @@
     <? } ?>
     <title>Attendance Capture</title>
     <?!= include('Styles'); ?>
+    <?!= include('SeatingStyles'); ?>
   </head>
   <body>
     <div class="app-shell">
@@ -136,6 +137,99 @@
         </aside>
       </main>
 
+      <section class="panel seating-panel" id="seatingPanel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Seating arrangement maker</p>
+            <h2>Create student locations and mark absences</h2>
+          </div>
+          <button id="markAbsentModeBtn" type="button" class="button button-secondary">Absent Mode: OFF</button>
+        </div>
+
+        <div class="seating-builder">
+          <div class="seating-side">
+            <div class="seating-controls">
+              <h3>Layout</h3>
+              <div class="seating-control-grid">
+                <label class="span-2">
+                  <span>Seating title</span>
+                  <input id="seatingTitleInput" type="text" placeholder="CE 101 - Monday Lecture" value="Class Seating Plan">
+                </label>
+                <label>
+                  <span>Rows</span>
+                  <input id="seatingRowsInput" type="number" min="1" max="20" value="5">
+                </label>
+                <label>
+                  <span>Columns</span>
+                  <input id="seatingColumnsInput" type="number" min="1" max="20" value="5">
+                </label>
+              </div>
+              <div class="actions">
+                <button id="createSeatingBtn" type="button" class="button button-primary">Create / Resize Grid</button>
+                <button id="saveSeatingBtn" type="button" class="button button-secondary">Save Seating Arrangement</button>
+              </div>
+
+              <div class="saved-plan-row">
+                <label>
+                  <span>Saved seating plans</span>
+                  <select id="savedSeatingPlans">
+                    <option value="">Select saved plan...</option>
+                  </select>
+                </label>
+                <button id="loadSeatingPlansBtn" type="button" class="button button-ghost">Refresh</button>
+              </div>
+            </div>
+
+            <div class="seat-editor" id="seatEditor" hidden>
+              <div>
+                <h3>Edit selected seat</h3>
+                <span id="selectedSeatLabel" class="selected-seat-pill">No seat selected</span>
+              </div>
+
+              <label>
+                <span>Nickname</span>
+                <input id="seatNicknameInput" type="text" placeholder="AJ / Val / Mendoza">
+              </label>
+
+              <label>
+                <span>Full name or notes</span>
+                <input id="seatNameInput" type="text" placeholder="Student full name">
+              </label>
+
+              <label class="file-input">
+                <span>Student photo</span>
+                <input id="seatPhotoInput" type="file" accept="image/*" capture="environment">
+                <small>Photos are compressed to small seat avatars before sync.</small>
+              </label>
+
+              <div class="seat-photo-preview" id="seatPhotoPreview" hidden>
+                <img id="seatPhotoPreviewImg" alt="Seat photo preview">
+                <small id="seatPhotoPreviewMeta"></small>
+              </div>
+
+              <div class="actions">
+                <button id="saveSeatBtn" type="button" class="button button-primary">Save Seat</button>
+                <button id="clearSeatBtn" type="button" class="button button-ghost">Clear Seat</button>
+              </div>
+            </div>
+
+            <div class="absence-panel">
+              <h3>Absence clicks</h3>
+              <p class="muted">Turn on Absent Mode, then click a student location. Absence clicks are queued locally and synced to the Seating Absences sheet when online.</p>
+              <div class="actions">
+                <button id="syncAbsencesBtn" type="button" class="button button-secondary">Sync Absences</button>
+                <button id="clearSyncedAbsencesBtn" type="button" class="button button-ghost">Clear Synced Absences</button>
+              </div>
+              <div id="absenceQueueList" class="absence-list empty">No absence clicks yet.</div>
+            </div>
+          </div>
+
+          <div class="seating-stage">
+            <div id="seatingGrid" class="seating-placeholder">Enter a row and column count, then click Create / Resize Grid.</div>
+          </div>
+        </div>
+      </section>
+
       <section class="panel queue-panel">
         <div class="panel-heading">
           <div>
@@ -161,5 +255,6 @@
     </div>
 
     <?!= include('Client'); ?>
+    <?!= include('SeatingClient'); ?>
   </body>
 </html>
